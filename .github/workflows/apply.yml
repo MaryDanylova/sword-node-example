@@ -1,0 +1,111 @@
+name: terraform-apply
+
+# Manual only: plan, apply or destroy one environment, or one stack of it. One job, so if the GitHub
+# Environment requires reviewers, they are asked once per run.
+#
+# Inputs (checked by the scripts, the same as locally):
+#   env      any directory under envs/overlays/; new environments are added through a PR
+#   stack    "all" (every stack in order, without access) or one stack
+#   action   plan (changes nothing), apply or destroy
+#   confirm  the env name, required to destroy anything outside dev
+#
+# access holds the role this job runs with:
+#   - It is applied only by naming it, never by "all", and cannot be destroyed from here.
+#   - Its first apply for an env is local: make access ENV=<env>. There is no role before that.
+#   - If a change breaks the apply role, CI cannot log in. Someone with admin rights re-applies locally.
+#
+# How it runs:
+#   - Everything goes through scripts/run-env.sh, as locally.
+#   - app-k8s talks to the private EKS API, so K8S_VIA=codebuild runs it as a build inside the VPC
+#     (stacks/ci-runner) on this run's commit. The hosted runner needs no tunnel.
+#   - No repository variables: scripts/ci-role.sh derives the role and region from envs/.
+#   - Who may run it: anyone who can dispatch it, within the GitHub Environment's rules (docs/DEPLOYMENT.md).
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: Environment (a directory under envs/overlays/)
+        type: string
+        default: dev
+      stack:
+        description: Stack (all = every stack in dependency order)
+        type: choice
+        options: [all, access, network, eks, ci-runner, database, app-aws, app-k8s, lb]
+        default: all
+      action:
+        description: plan (changes nothing), apply or destroy
+        type: choice
+        options: [plan, apply, destroy]
+        default: plan
+      confirm:
+        description: Type the env name to confirm a destroy outside dev
+        type: string
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+# One run per environment at a time, whatever stack it targets.
+concurrency:
+  group: tf-${{ inputs.env }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment: ${{ inputs.env }}
+    env:
+      ENV: ${{ inputs.env }}
+      STACK: ${{ inputs.stack }}
+      ACTION: ${{ inputs.action }}
+      CONFIRM: ${{ inputs.confirm }}
+      K8S_VIA: codebuild
+      TF_INPUT: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve role and region
+        id: cfg
+        run: scripts/ci-role.sh "$ENV" apply >> "$GITHUB_OUTPUT"
+
+      # The CodeBuild build installs the same Terraform version (scripts/py/codebuild.py).
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.13.3"
+          terraform_wrapper: false
+
+      # app-k8s goes through scripts/py/codebuild.py (K8S_VIA=codebuild).
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.1"
+
+      # Write-capable role, trusted only for runs bound to the GitHub Environment <env>; the plan role
+      # used by ci.yml stays read-only. A whole environment takes ~30 min: the session must outlive it.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.cfg.outputs.role_arn }}
+          aws-region: ${{ steps.cfg.outputs.region }}
+          role-duration-seconds: 7200
+
+      - name: ${{ inputs.action }} ${{ inputs.env }} / ${{ inputs.stack }}
+        run: |
+          set -o pipefail
+          case "$ACTION" in
+            plan)    target=plan-all; args=-no-color ;;
+            apply)   target=up-all;   args=-auto-approve ;;
+            destroy) target=down-all; args=-auto-approve ;;
+          esac
+          if [[ "$STACK" == all ]]; then only=""; else only="$STACK"; fi
+          ONLY="$only" make "$target" ENV="$ENV" CONFIRM="$CONFIRM" ARGS="$args" 2>&1 | tee run.txt
+
+      - name: Summary
+        if: always() && inputs.action == 'plan' && hashFiles('run.txt') != ''
+        run: |
+          {
+            echo "### plan $ENV / $STACK"
+            echo '```'
+            if grep -q '^Summary (' run.txt; then sed -n '/^Summary (/,$p' run.txt; else tail -n 40 run.txt; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

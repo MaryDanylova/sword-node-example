@@ -1,0 +1,7 @@
+# Python commands in scripts/py/ (uv run --script main.py, dependencies inline per PEP 723, no pyproject.toml).
+# uvx ruff check scripts && uvx ruff format scripts
+line-length = 120
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "W", "I", "B", "UP"]

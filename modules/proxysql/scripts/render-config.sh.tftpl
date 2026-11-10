@@ -1,0 +1,51 @@
+set -eu
+get() { aws secretsmanager get-secret-value --secret-id "$1" --query SecretString --output text | jq -r '.username, .password'; }
+get "$APP_SECRET_ARN" > /config/app
+get "$MONITOR_SECRET_ARN" > /config/monitor
+{ read -r AU; read -r AP; } < /config/app
+{ read -r MU; read -r MP; } < /config/monitor
+rm /config/app /config/monitor
+# database generates [A-Za-z0-9] passwords and validates names: safe inside proxysql.cnf.
+case "$AU$AP$MU$MP" in *[!A-Za-z0-9_]*) echo "unexpected characters in a user secret" >&2; exit 1 ;; esac
+case "$BACKEND_HOST$BACKEND_PORT" in *[!A-Za-z0-9.:-]*) echo "unexpected backend address" >&2; exit 1 ;; esac
+
+# Admin interface: on 127.0.0.1 only, so reaching it needs kubectl exec into the pod (RBAC on
+# pods/exec is the real access control). A random password per pod, readable there for the
+# cutover script: no shared admin secret to store or rotate. A ProxySQL Cluster (admin port on
+# the network) would need a managed one instead.
+ADMIN_PW="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+printf '%s\n' "$ADMIN_PW" > /config/admin_password
+
+# CA of the RDS endpoint certificates (ProxySQL -> MySQL TLS).
+curl -fsS --retry 3 -o /config/rds-ca.pem "https://truststore.pki.rds.amazonaws.com/$AWS_REGION/$AWS_REGION-bundle.pem"
+
+cat > /config/proxysql.cnf <<CNF
+datadir="/var/lib/proxysql"
+admin_variables=
+{
+  admin_credentials="admin:$ADMIN_PW"
+  mysql_ifaces="127.0.0.1:6032"
+}
+mysql_variables=
+{
+  interfaces="0.0.0.0:${port}"
+  threads=2
+  max_connections=1024
+  server_version="8.4.0"
+  have_ssl=true
+  ssl_p2s_ca="/config/rds-ca.pem"
+  monitor_username="$MU"
+  monitor_password="$MP"
+  monitor_connect_interval=10000
+  monitor_ping_interval=5000
+}
+mysql_servers=
+(
+  { address="$BACKEND_HOST", port=$BACKEND_PORT, hostgroup=10, use_ssl=1, max_connections=${backend_max_connections} }
+)
+mysql_users=
+(
+  { username="$AU", password="$AP", default_hostgroup=10, use_ssl=1, active=1 }
+)
+CNF
+echo "proxysql.cnf rendered: backend $BACKEND_HOST:$BACKEND_PORT, user $AU, monitor $MU"

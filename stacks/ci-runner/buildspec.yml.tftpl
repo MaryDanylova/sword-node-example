@@ -1,0 +1,24 @@
+version: 0.2
+phases:
+  install:
+    commands:
+      - curl -fsSL "https://releases.hashicorp.com/terraform/$${TF_VERSION}/terraform_$${TF_VERSION}_linux_amd64.zip" -o /tmp/terraform.zip
+      - unzip -qo /tmp/terraform.zip -d /usr/local/bin && terraform version
+      - |
+        if [ "$TARGET" = db-restore ]; then
+          curl -fsSL "https://dl.k8s.io/release/v${kubectl_version}/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
+          chmod +x /usr/local/bin/kubectl && kubectl version --client
+          curl -fsSL "https://astral.sh/uv/${uv_version}/install.sh" | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+          uv --version
+        fi
+  build:
+    commands:
+      - |
+        # Inside the VPC: dial the private endpoint directly, as the build role (cluster-admin here).
+        export TF_INPUT=false TF_IN_AUTOMATION=true TF_VAR_kube_api_host= TF_VAR_assume_admin_role=false
+        case "$TARGET" in
+          plan | up | down) make --no-print-directory "$TARGET" STACK="$STACK" ENV="$ENV" ARGS="$ARGS" CONFIRM="$CONFIRM" ;;
+          # The Kubernetes steps of a DB restore (check, cutover in the ProxySQL pods): kubectl only.
+          db-restore) scripts/py/main.py db-restore "$ENV" $ARGS ;;
+          *) echo "TARGET must be plan, up, down or db-restore, got '$TARGET'"; exit 1 ;;
+        esac

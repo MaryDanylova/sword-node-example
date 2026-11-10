@@ -1,0 +1,37 @@
+# Terraform working dirs, state and plans (state lives in S3; bootstrap/* state is thrown away)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+# NOTE: .terraform.lock.hcl is intentionally committed (pins provider versions)
+
+# Kubernetes / local access
+.kube/
+kubeconfig*
+!kubeconfig.sh
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Private working notes (not part of the delivery)
+temp/
+
+# Account-specific local overrides
+*.auto.tfvars
+
+# Certificates saved locally (docs/DEPLOYMENT.md: HTTPS)
+*.pem
+
+# Python (scripts/*.py run by uv)
+__pycache__/
+.ruff_cache/

@@ -1,0 +1,63 @@
+# Checkov configuration (loaded automatically from the repository root).
+# Every skipped check below is a conscious decision for this demo, not an oversight.
+# Remaining gaps are listed in docs/PRODUCTION.md.
+framework:
+  - terraform
+quiet: true
+compact: true
+skip-path:
+  - .terraform
+skip-check:
+  # Settings that differ per environment. Checkov reads variable defaults, not envs/overlays/<env>/*.tfvars:
+  # the example in envs/examples/prod sets multi_az = true and deletion_protection = true (RDS and ALB).
+  - CKV_AWS_157 # RDS Multi-AZ (prod: multi_az = true)
+  - CKV_AWS_293 # RDS deletion protection (prod: true)
+  - CKV_AWS_150 # ALB deletion protection (prod: true)
+
+  # Public ALB: there is no domain, so no trusted certificate. HTTPS depends on the env's inputs
+  # (https_self_signed in lb; modules/alb certificate_arn for ACM), which checkov does not read. Prod
+  # hardening is an ACM-issued certificate, WAF and access logs, listed in docs/PRODUCTION.md.
+  - CKV_AWS_2   # ALB listener protocol is HTTPS
+  - CKV_AWS_103 # ALB TLS 1.2 (needs an HTTPS listener)
+  - CKV_AWS_378 # target group does not use HTTP (ALB to nodes inside the VPC)
+  - CKV2_AWS_20 # HTTP to HTTPS redirect
+  - CKV2_AWS_28 # WAF in front of the public ALB
+  - CKV_AWS_260 # port 80 open to 0.0.0.0/0 (restricted via lb_allowed_cidrs)
+  - CKV_AWS_91  # ALB access logs (needs a log bucket)
+  - CKV2_AWS_15 # ASG ELB health checks (the target group checks the nodes)
+
+  # S3: buckets are private, encrypted (SSE-S3), versioned where it matters. The items below
+  # cost money or add moving parts that a demo does not need.
+  - CKV_AWS_145 # KMS customer-managed key for S3
+  - CKV_AWS_144 # cross-region replication
+  - CKV_AWS_18  # S3 access logging
+  - CKV2_AWS_62 # S3 event notifications
+  - CKV_AWS_166 # AWS Backup vault with a KMS CMK (default AWS-managed key is used)
+  - CKV_AWS_149 # Secrets Manager secret with a KMS CMK (app DB user secret; aws/secretsmanager key, like the RDS master secret)
+  - CKV2_AWS_57 # automatic rotation (app DB user secret: rotate by bumping db_users.<user>.password_version; the app-k8s Job resets the user)
+  - CKV_AWS_158 # CloudWatch log group with a KMS CMK (CodeBuild runner logs; default encryption is used)
+  - CKV_AWS_338 # log retention of 1 year (log_retention_days per env: 7 in dev, 90 in prod)
+
+  # Instances: a small t4g.nano host (bastion), costs and purpose
+  - CKV_AWS_126 # detailed monitoring (paid)
+  - CKV_AWS_135 # EBS optimized (not supported on t4g.nano)
+  - CKV_AWS_118 # RDS enhanced monitoring (paid)
+  - CKV_AWS_161 # RDS IAM authentication (the app uses its own MySQL user, with its secret in Secrets Manager)
+
+  # CI apply role: AdministratorAccess keeps the demo simple (github_apply_policy_arns in access);
+  # a least-privilege policy is listed in docs/PRODUCTION.md.
+  - CKV_AWS_274
+
+  # OIDC trust: the sub pattern needs a wildcard to cover pull_request and branch runs.
+  # The plan role trusts every run of the repo (access); the apply role is already narrowed to environment:<env>.
+  - CKV_AWS_358
+
+  # Image and module pinning: the image tag 0.0.1 is the only one published and modules are
+  # version-pinned; digest/commit pinning is listed in docs/PRODUCTION.md.
+  - CKV_K8S_43 # image by digest
+  - CKV_K8S_15 # imagePullPolicy Always (pinned tag, IfNotPresent is intended)
+  - CKV_K8S_11 # CPU limits (requests are set; limits would throttle the app)
+  - CKV_TF_1   # module sources by commit hash
+
+  # Data source result, not a resource
+  - CKV_AWS_394

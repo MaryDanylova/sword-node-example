@@ -1,0 +1,140 @@
+name: db-restore
+
+# Manual MySQL restore for one environment, with the same command as locally (make db-restore).
+#
+# Actions:
+#   list      what can be restored (PITR windows, snapshots, AWS Backup recovery points).
+#             Read-only, with the plan role and no approval: look first, then dispatch a restore.
+#   restore   point = "latest", a UTC time (2026-01-31T12:00:00Z), or a snapshot id / recovery point ARN.
+#             In one run: a new instance next to the live one, a check, the ProxySQL cutover, then
+#             Terraform follows. Apps keep their connections and see the restored data from their next
+#             query on. Writes after the point are not in it.
+#             - stop_before_cutover = true ends after the check; dispatch again without it to switch.
+#             - Re-running after a failure continues where it stopped.
+#   rollback  instance = the previous one, still running until retire: switch back to it.
+#   retire    instance = one nothing uses any more: deleted with a final snapshot (outside dev: confirm).
+#
+# Everything except list runs with the apply role in the GitHub Environment <env>, one job per run. The
+# Kubernetes steps run as ci-runner builds inside the VPC on this run's commit, as in apply.yml.
+# A restore takes about 15-30 min, mostly RDS creating the instance.
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: Environment (a directory under envs/overlays/)
+        type: string
+        default: dev
+      action:
+        description: list (read-only), restore, rollback or retire
+        type: choice
+        options: [list, restore, rollback, retire]
+        default: list
+      point:
+        description: "restore: latest | UTC time like 2026-01-31T12:00:00Z | snapshot id or recovery point ARN"
+        type: string
+        required: false
+      instance:
+        description: "rollback / retire: the instance id (from list)"
+        type: string
+        required: false
+      stop_before_cutover:
+        description: "restore: stop after the check, before the apps are switched"
+        type: boolean
+        default: false
+      confirm:
+        description: Type the env name to retire an instance outside dev
+        type: string
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+# Shared with apply.yml: never a restore and an apply of the same env at once.
+concurrency:
+  group: tf-${{ inputs.env }}
+  cancel-in-progress: false
+
+env:
+  ENV: ${{ inputs.env }}
+  TF_INPUT: "false"
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  list:
+    if: inputs.action == 'list'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve role and region
+        id: cfg
+        run: scripts/ci-role.sh "$ENV" plan >> "$GITHUB_OUTPUT"
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.13.3"
+          terraform_wrapper: false
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.1"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.cfg.outputs.role_arn }}
+          aws-region: ${{ steps.cfg.outputs.region }}
+
+      - name: list ${{ inputs.env }}
+        run: |
+          set -o pipefail
+          scripts/py/main.py db-restore "$ENV" list 2>&1 | tee list.txt
+          { echo "### Restore points ($ENV)"; echo '```'; cat list.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  run:
+    if: inputs.action != 'list'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: ${{ inputs.env }}
+    env:
+      ACTION: ${{ inputs.action }}
+      POINT: ${{ inputs.point }}
+      INSTANCE: ${{ inputs.instance }}
+      STOP: ${{ inputs.stop_before_cutover }}
+      CONFIRM: ${{ inputs.confirm }}
+      K8S_VIA: codebuild
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve role and region
+        id: cfg
+        run: scripts/ci-role.sh "$ENV" apply >> "$GITHUB_OUTPUT"
+
+      # The CodeBuild build installs the same Terraform version (scripts/py/codebuild.py).
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.13.3"
+          terraform_wrapper: false
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.1"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.cfg.outputs.role_arn }}
+          aws-region: ${{ steps.cfg.outputs.region }}
+          role-duration-seconds: 7200
+
+      - name: ${{ inputs.action }} ${{ inputs.env }}
+        # db_restore.py checks the inputs (an empty point or instance stops there, with the reason).
+        run: |
+          if [[ "$ACTION" == restore ]]; then
+            stop=(); if [[ "$STOP" == true ]]; then stop=(--stop-before-cutover); fi
+            scripts/py/main.py db-restore "$ENV" restore "$POINT" "${stop[@]}"
+          else
+            scripts/py/main.py db-restore "$ENV" "$ACTION" "$INSTANCE"
+          fi

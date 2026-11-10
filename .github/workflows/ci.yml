@@ -1,0 +1,145 @@
+name: terraform-ci
+
+# Every pull request, whatever it touches: a base tfvars, module or stack change affects every env.
+#
+# 1. lint: fmt / validate / tflint / ruff / checkov (no AWS).
+# 2. plan: for EVERY env under envs/overlays/ (one job per env, because each env has its own
+#    read-only plan role):
+#    - access (the env's roles), so role changes are visible in the PR; applied with apply.yml
+#      (stack = access) or locally;
+#    - `make plan-all` (every other stack). app-k8s is not planned: runners cannot reach the
+#      private EKS API.
+#    An env must be bootstrapped (state bucket + access roles) before its PR can pass.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_VERSION: "1.13.3"
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    outputs:
+      envs: ${{ steps.envs.outputs.envs }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: List envs (every envs/overlays/<env>/common.tfvars, see make init-env)
+        id: envs
+        run: echo "envs=$(ls envs/overlays/*/common.tfvars | cut -d/ -f3 | jq -Rnc '[inputs]')" | tee -a "$GITHUB_OUTPUT"
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: fmt
+        run: terraform fmt -check -recursive
+
+      - name: validate (every root, no backend)
+        run: make validate
+
+      - uses: terraform-linters/setup-tflint@v4
+
+      - name: tflint
+        run: |
+          tflint --init
+          tflint --recursive --minimum-failure-severity=error
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.1"
+
+      - name: ruff (scripts/*.py, ruff.toml)
+        run: |
+          uvx ruff@0.14.4 check scripts
+          uvx ruff@0.14.4 format --check scripts
+
+      - name: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: terraform
+          quiet: true
+          config_file: .checkov.yaml # skipped checks and their reasons live there
+
+  plan:
+    needs: lint
+    # Fork PRs get no OIDC token, so skip them.
+    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    strategy:
+      fail-fast: true
+      matrix:
+        env: ${{ fromJSON(needs.lint.outputs.envs) }}
+
+    env:
+      ENV: ${{ matrix.env }}
+      TF_INPUT: "false"
+      PLAN_ARGS: -lock=false -no-color
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Role (<project>-<env>-github-plan, stacks/access) and region come from envs/, no repository variables.
+      - name: Resolve role and region
+        id: cfg
+        run: scripts/ci-role.sh "$ENV" plan >> "$GITHUB_OUTPUT"
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        id: aws
+        with:
+          role-to-assume: ${{ steps.cfg.outputs.role_arn }}
+          aws-region: ${{ steps.cfg.outputs.region }}
+
+      - name: Explain a failed login
+        if: failure() && steps.aws.outcome == 'failure'
+        run: |
+          echo "::error::Could not assume ${{ steps.cfg.outputs.role_arn }}. Most likely env '$ENV' is not bootstrapped yet: someone with admin rights runs 'make state ENV=$ENV' and 'make access ENV=$ENV' (docs/ENVIRONMENTS.md), then re-runs this job."
+
+      # Same entry point as local use (scripts/run-env.sh), for access and then for the rest. Stops at
+      # the first error; stacks whose upstream is not applied are skipped with a note.
+      - name: plan access
+        run: |
+          set -o pipefail
+          ONLY=access make plan-all ENV="$ENV" ARGS="$PLAN_ARGS" 2>&1 | tee plan-access.txt
+
+      - name: plan-all
+        run: |
+          set -o pipefail
+          NO_K8S=1 make plan-all ENV="$ENV" ARGS="$PLAN_ARGS" 2>&1 | tee plan.txt
+
+      - name: Summary
+        if: always() && (hashFiles('plan-access.txt') != '' || hashFiles('plan.txt') != '')
+        run: |
+          {
+            echo "### $ENV"
+            echo '```'
+            # One line per stack (scripts/run-env.sh); a run that stopped early has none: show its end.
+            for f in plan-access.txt plan.txt; do
+              [[ -f "$f" ]] || continue
+              if grep -q '^Summary (' "$f"; then sed -n '/^Summary (/,$p' "$f" | tail -n +2; else tail -n 40 "$f"; fi
+            done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
